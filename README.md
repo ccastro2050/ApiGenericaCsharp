@@ -182,6 +182,8 @@ Solo modifica el valor de `DatabaseProvider`:
 | POST | `/api/{tabla}` | Crear registro | Si |
 | PUT | `/api/{tabla}/{clave}/{valor}` | Actualizar registro | Si |
 | DELETE | `/api/{tabla}/{clave}/{valor}` | Eliminar registro | Si |
+| POST | `/api/{tabla}/verificar-contrasena` | Verificar contrasena BCrypt | Si |
+| GET | `/api/info` | Informacion del controller | No |
 
 ### ConsultasController - SQL Parametrizado
 
@@ -349,10 +351,10 @@ ApiGenericaCsharp/
 |
 |-- Servicios/
 |   |-- Abstracciones/
-|   |   |-- IServicioCrud.cs          # Contrato CRUD
-|   |   |-- IServicioConsultas.cs     # Contrato consultas
-|   |   |-- IProveedorConexion.cs     # Contrato conexion
-|   |   +-- IPoliticaTablasProhibidas.cs
+|   |   |-- IServicioCrud.cs          # Contrato CRUD (Listar, Crear, Actualizar, Eliminar)
+|   |   |-- IServicioConsultas.cs     # Contrato consultas parametrizadas y SP
+|   |   |-- IProveedorConexion.cs     # Contrato conexion (cadena + proveedor activo)
+|   |   +-- IPoliticaTablasProhibidas.cs  # Contrato tablas prohibidas
 |   |-- Conexion/
 |   |   +-- ProveedorConexion.cs      # Proveedor de conexion
 |   |-- Politicas/
@@ -381,8 +383,10 @@ ApiGenericaCsharp/
 |
 |-- appsettings.json                  # Configuracion produccion
 |-- appsettings.Development.json      # Configuracion desarrollo
-|-- Program.cs                        # Punto de entrada
-|-- ApiGenericaCsharp.csproj                # Definicion del proyecto
+|-- Program.cs                        # Punto de entrada y DI
+|-- ApiGenericaCsharp.csproj          # Definicion del proyecto y paquetes NuGet
+|-- ApiGenericaCsharp.sln             # Solucion de Visual Studio
+|-- ApiGenericaCsharp.http            # Archivo de pruebas HTTP (VS Code REST Client)
 +-- README.md                         # Este archivo
 ```
 
@@ -409,6 +413,7 @@ ApiGenericaCsharp/
 | Dapper | 2.1.66 | Micro ORM |
 | BCrypt.Net-Next | 4.0.3 | Hash de contrasenas |
 | Swashbuckle | 9.0.4 | Swagger UI |
+| Swashbuckle ReDoc | 10.1.2 | ReDoc UI (documentacion alternativa) |
 | Microsoft.Data.SqlClient | 6.1.1 | Conexion SQL Server |
 | Npgsql | 9.0.3 | Conexion PostgreSQL |
 | MySqlConnector | 2.4.0 | Conexion MySQL/MariaDB |
@@ -427,6 +432,7 @@ ApiGenericaCsharp/
   <PackageReference Include="MySqlConnector" Version="2.4.0" />
   <PackageReference Include="Npgsql" Version="9.0.3" />
   <PackageReference Include="Swashbuckle.AspNetCore" Version="9.0.4" />
+  <PackageReference Include="Swashbuckle.AspNetCore.ReDoc" Version="10.1.2" />
 </ItemGroup>
 ```
 
@@ -435,10 +441,11 @@ ApiGenericaCsharp/
 ## Probar la API
 
 1. Ejecutar: `dotnet run`
-2. Abrir: `http://localhost:5000/swagger`
-3. Probar endpoint de diagnostico: `GET /api/diagnostico/salud`
-4. Hacer login para obtener token
-5. Usar token en endpoints protegidos
+2. Abrir Swagger: `http://localhost:5000/swagger`
+3. Abrir ReDoc: `http://localhost:5000/redoc`
+4. Probar endpoint de diagnostico: `GET /api/diagnostico/conexion`
+5. Hacer login para obtener token: `POST /api/autenticacion/token`
+6. Usar token en endpoints protegidos (boton "Authorize" en Swagger)
 
 ---
 
@@ -491,6 +498,69 @@ dotnet dev-certs https --trust
 - Ejecuta `dotnet restore` para restaurar los paquetes NuGet
 - Verifica que las versiones de los paquetes sean compatibles con .NET 9.0
 - Limpia y recompila: `dotnet clean && dotnet build`
+
+---
+
+## Registro de Dependencias (Program.cs)
+
+La inyeccion de dependencias se configura en `Program.cs` segun el proveedor activo:
+
+```csharp
+// Servicios (siempre los mismos)
+builder.Services.AddSingleton<IPoliticaTablasProhibidas>(politica);
+builder.Services.AddSingleton<IProveedorConexion, ProveedorConexion>();
+builder.Services.AddScoped<IServicioCrud, ServicioCrud>();
+builder.Services.AddScoped<IServicioConsultas, ServicioConsultas>();
+
+// Repositorios (cambian segun DatabaseProvider)
+// "Postgres"      -> RepositorioLecturaPostgreSQL + RepositorioConsultasPostgreSQL
+// "MySQL/MariaDB" -> RepositorioLecturaMysqlMariaDB + RepositorioConsultasMysqlMariaDB
+// "SqlServer"     -> RepositorioLecturaSqlServer + RepositorioConsultasSqlServer (default)
+```
+
+---
+
+## Equivalencias C# vs Python (FastAPI)
+
+| Concepto | C# (.NET) | Python (FastAPI) |
+|----------|-----------|------------------|
+| Framework | ASP.NET Core | FastAPI |
+| ORM | Dapper (Micro-ORM) | SQLAlchemy async |
+| Inyeccion de Dependencias | `builder.Services.AddScoped<>()` | `Depends()` en endpoints |
+| Interfaces | `interface IServicioCrud` | `Protocol` (typing) |
+| Configuracion | `appsettings.json` | `.env` + pydantic-settings |
+| Autenticacion | JWT Bearer middleware | JWT manual con python-jose |
+| Servidor web | Kestrel (integrado) | Uvicorn (ASGI) |
+| Documentacion API | Swagger + ReDoc (Swashbuckle) | Swagger + ReDoc (integrado en FastAPI) |
+| Hash contrasenas | BCrypt.Net-Next | passlib + bcrypt |
+| Async/Await | `async Task<>` nativo | `async def` nativo |
+
+---
+
+## Comandos Utiles
+
+```bash
+# Restaurar paquetes
+dotnet restore
+
+# Compilar
+dotnet build
+
+# Ejecutar
+dotnet run
+
+# Ejecutar en modo watch (recarga automatica)
+dotnet watch run
+
+# Limpiar y recompilar
+dotnet clean && dotnet build
+
+# Confiar certificado SSL de desarrollo
+dotnet dev-certs https --trust
+
+# Ver version de .NET instalada
+dotnet --version
+```
 
 ---
 
