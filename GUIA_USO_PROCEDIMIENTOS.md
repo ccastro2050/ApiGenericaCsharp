@@ -840,8 +840,8 @@ Resumen rapido de los 5 stored procedures disponibles para facturas y productosp
 |----|--------------|---------|
 | `sp_listar_facturas_y_productosporfactura` | (ninguno) | Array de facturas con productos anidados |
 | `sp_consultar_factura_y_productosporfactura` | `p_numero` (int) | Objeto {factura, productos} |
-| `sp_insertar_factura_y_productosporfactura` | `p_fkidcliente` (int), `p_fkidvendedor` (int), `p_productos` (JSON string) | Factura creada con productos |
-| `sp_actualizar_factura_y_productosporfactura` | `p_numero` (int), `p_fkidcliente` (int), `p_fkidvendedor` (int), `p_productos` (JSON string) | Factura actualizada |
+| `sp_insertar_factura_y_productosporfactura` | `p_fkidcliente` (int), `p_fkidvendedor` (int), `p_productos` (JSON string), `p_minimo_detalle` (int, opcional, default 1) | Factura creada con productos |
+| `sp_actualizar_factura_y_productosporfactura` | `p_numero` (int), `p_fkidcliente` (int), `p_fkidvendedor` (int), `p_productos` (JSON string), `p_minimo_detalle` (int, opcional, default 1) | Factura actualizada |
 | `sp_borrar_factura_y_productosporfactura` | `p_numero` (int) | Confirmacion de eliminacion |
 
 > Todos tienen `INOUT p_resultado JSON` que se envia como `null`.
@@ -855,6 +855,53 @@ Resumen rapido de los 5 stored procedures disponibles para facturas y productosp
 Cada objeto del array requiere:
 - `codigo` → codigo del producto (debe existir en tabla producto)
 - `cantidad` → cantidad a facturar (debe haber stock suficiente)
+
+### Parametro p_minimo_detalle (opcional)
+
+Controla el numero minimo de productos que debe tener la factura. Si no se envia, por defecto exige al menos 1 producto.
+
+| Valor enviado | Comportamiento |
+|---|---|
+| No se envia | Exige minimo 1 producto (default) |
+| `"p_minimo_detalle": 3` | Exige minimo 3 productos |
+| `"p_minimo_detalle": 5` | Exige minimo 5 productos |
+
+**Ejemplo: Exigir minimo 3 productos**
+
+```json
+{
+  "nombreSP": "sp_insertar_factura_y_productosporfactura",
+  "p_fkidcliente": 1,
+  "p_fkidvendedor": 2,
+  "p_productos": "[{\"codigo\":\"PR003\",\"cantidad\":2}]",
+  "p_minimo_detalle": 3,
+  "p_resultado": null
+}
+```
+
+Respuesta (error porque solo hay 1 producto):
+
+```json
+{
+  "estado": 500,
+  "detalle": "P0001: La factura requiere minimo 3 producto(s)."
+}
+```
+
+> **Nota tecnica:** La API envia `0` cuando no se incluye `p_minimo_detalle` en el payload. El SP usa `COALESCE(NULLIF(p_minimo_detalle, 0), 1)` para tratar `0` como `1` (default).
+
+### Validacion de stock
+
+El trigger `actualizar_totales_y_stock()` valida automaticamente que haya stock suficiente antes de descontar. Si la cantidad solicitada supera el stock disponible:
+
+```json
+{
+  "estado": 500,
+  "detalle": "P0001: Stock insuficiente para producto PR007. Stock disponible: 9, cantidad solicitada: 100"
+}
+```
+
+La factura no se crea y el stock queda intacto (transaccion atomica).
 
 ### Estructura de respuesta del SP listar
 
@@ -955,8 +1002,8 @@ Si el SP tiene esquema (ej: `public.mi_sp`), tambien lo maneja correctamente.
 | Codigo | Significado | Cuando ocurre |
 |--------|-------------|---------------|
 | 200 | OK | SP ejecutado correctamente |
-| 400 | Bad Request | Falta `nombreSP`, parametros invalidos |
-| 500 | Server Error | Error en la BD, SP no existe, error de tipos |
+| 400 | Bad Request | Falta `nombreSP`, parametros invalidos, SP no existe en la BD |
+| 500 | Server Error | Error en la BD, error de tipos, stock insuficiente, minimo de productos |
 
 ### Ejemplo error 400
 
@@ -989,11 +1036,13 @@ Si el SP tiene esquema (ej: `public.mi_sp`), tambien lo maneja correctamente.
 
 **Solucion:** Asegurarse de incluir `"nombreSP": "nombre_del_sp"` en el JSON.
 
-### 2. "function/procedure X does not exist"
+### 2. "El procedimiento o funcion 'X' no existe en la base de datos"
+
+**Codigo:** 400 Bad Request
 
 **Causa:** El nombre del SP no coincide con lo que existe en la BD.
 
-**Solucion:** Verificar el nombre exacto del SP en la base de datos. Los nombres son case-sensitive en PostgreSQL.
+**Solucion:** Verificar el nombre exacto del SP. Los nombres son case-sensitive en PostgreSQL.
 
 ### 3. Error al pasar p_resultado como "" en vez de null
 
@@ -1012,7 +1061,13 @@ Si el SP tiene esquema (ej: `public.mi_sp`), tambien lo maneja correctamente.
 
 **Solucion:** Verificar stock antes de insertar/actualizar. El trigger de la BD valida esto automaticamente.
 
-### 5. Error de tipo de dato
+### 5. Error de minimo de productos
+
+**Causa:** La factura no tiene suficientes productos segun `p_minimo_detalle`.
+
+**Solucion:** Agregar mas productos al array `p_productos`, o no enviar `p_minimo_detalle` (default: 1).
+
+### 6. Error de tipo de dato
 
 **Causa:** Se envio un string donde se esperaba un numero, o viceversa.
 
