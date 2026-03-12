@@ -198,7 +198,13 @@ private async Task<List<(string Nombre, string Modo, string Tipo)>> ObtenerMetad
                     cmdTipo.Parameters.AddWithValue("@esquema", esquema);
                 }
                 var resultado = await cmdTipo.ExecuteScalarAsync();
-                tipoRutina = resultado?.ToString() ?? "PROCEDURE";
+                if (resultado == null)
+                {
+                    throw new ArgumentException(
+                        $"El procedimiento o función '{nombreSP}' no existe en la base de datos. " +
+                        "Verifique el nombre e intente de nuevo.");
+                }
+                tipoRutina = resultado.ToString() ?? "PROCEDURE";
             }
 
             var metadatos = await ObtenerMetadatosParametrosAsync(conexion, nombreSPSinEsquema, esquema);
