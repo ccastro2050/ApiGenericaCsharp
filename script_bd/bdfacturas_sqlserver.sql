@@ -322,7 +322,7 @@ BEGIN
     DECLARE @v_count INT;
     DECLARE @v_msg NVARCHAR(500);
 
-    -- Validar minimo de productos
+    -- Validar minimo de productos (antes de abrir transaccion)
     -- COALESCE(NULLIF(@p_minimo_detalle, 0), 1): la API envia 0 cuando no se pasa el parametro
     SET @v_minimo = COALESCE(NULLIF(@p_minimo_detalle, 0), 1);
 
@@ -339,54 +339,77 @@ BEGIN
         THROW 50002, @v_msg, 1;
     END
 
-    -- Crear la factura con total 0 (el trigger actualiza el total)
-    INSERT INTO factura (fkidcliente, fkidvendedor, total)
-    VALUES (@p_fkidcliente, @p_fkidvendedor, 0);
+    -- ── TRANSACCION: todo o nada ──
+    -- Si un trigger falla (ej: stock insuficiente en el 2do producto),
+    -- se revierte la factura y todos los productos insertados previamente.
+    BEGIN TRY
+        BEGIN TRANSACTION;
 
-    SET @v_numero = SCOPE_IDENTITY();
+        -- Crear la factura con total 0 (el trigger actualiza el total)
+        INSERT INTO factura (fkidcliente, fkidvendedor, total)
+        VALUES (@p_fkidcliente, @p_fkidvendedor, 0);
 
-    -- Recorrer cada producto del JSON e insertar detalle
-    -- El trigger calcula subtotal, descuenta stock y actualiza total
-    DECLARE producto_cursor CURSOR LOCAL FAST_FORWARD FOR
-        SELECT
-            JSON_VALUE(value, '$.codigo'),
-            CAST(JSON_VALUE(value, '$.cantidad') AS INT)
-        FROM OPENJSON(@p_productos);
+        SET @v_numero = SCOPE_IDENTITY();
 
-    OPEN producto_cursor;
-    FETCH NEXT FROM producto_cursor INTO @v_codigo, @v_cantidad;
+        -- Recorrer cada producto del JSON e insertar detalle
+        -- El trigger calcula subtotal, descuenta stock y actualiza total
+        DECLARE producto_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT
+                JSON_VALUE(value, '$.codigo'),
+                CAST(JSON_VALUE(value, '$.cantidad') AS INT)
+            FROM OPENJSON(@p_productos);
 
-    WHILE @@FETCH_STATUS = 0
-    BEGIN
-        INSERT INTO productosporfactura (fknumfactura, fkcodproducto, cantidad, subtotal)
-        VALUES (@v_numero, @v_codigo, @v_cantidad, 0);
-
+        OPEN producto_cursor;
         FETCH NEXT FROM producto_cursor INTO @v_codigo, @v_cantidad;
-    END
 
-    CLOSE producto_cursor;
-    DEALLOCATE producto_cursor;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            INSERT INTO productosporfactura (fknumfactura, fkcodproducto, cantidad, subtotal)
+            VALUES (@v_numero, @v_codigo, @v_cantidad, 0);
 
-    -- Retornar resultado como JSON
-    DECLARE @v_factura_json NVARCHAR(MAX);
-    DECLARE @v_productos_json NVARCHAR(MAX);
+            FETCH NEXT FROM producto_cursor INTO @v_codigo, @v_cantidad;
+        END
 
-    SELECT @v_factura_json = (
-        SELECT f.numero, f.fecha, f.total, f.fkidcliente, f.fkidvendedor
-        FROM factura f WHERE f.numero = @v_numero
-        FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
-    );
+        CLOSE producto_cursor;
+        DEALLOCATE producto_cursor;
 
-    SELECT @v_productos_json = (
-        SELECT pf.fkcodproducto AS codigo_producto, pr.nombre AS nombre_producto,
-               pf.cantidad, pr.valorunitario, pf.subtotal
-        FROM productosporfactura pf
-        JOIN producto pr ON pr.codigo = pf.fkcodproducto
-        WHERE pf.fknumfactura = @v_numero
-        FOR JSON PATH
-    );
+        -- Retornar resultado como JSON
+        DECLARE @v_factura_json NVARCHAR(MAX);
+        DECLARE @v_productos_json NVARCHAR(MAX);
 
-    SET @p_resultado = '{"factura":' + @v_factura_json + ',"productos":' + ISNULL(@v_productos_json, '[]') + '}';
+        SELECT @v_factura_json = (
+            SELECT f.numero, f.fecha, f.total, f.fkidcliente, f.fkidvendedor
+            FROM factura f WHERE f.numero = @v_numero
+            FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+        );
+
+        SELECT @v_productos_json = (
+            SELECT pf.fkcodproducto AS codigo_producto, pr.nombre AS nombre_producto,
+                   pf.cantidad, pr.valorunitario, pf.subtotal
+            FROM productosporfactura pf
+            JOIN producto pr ON pr.codigo = pf.fkcodproducto
+            WHERE pf.fknumfactura = @v_numero
+            FOR JSON PATH
+        );
+
+        SET @p_resultado = '{"factura":' + @v_factura_json + ',"productos":' + ISNULL(@v_productos_json, '[]') + '}';
+
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+
+        -- Cerrar cursor si quedo abierto
+        IF CURSOR_STATUS('local', 'producto_cursor') >= 0
+        BEGIN
+            CLOSE producto_cursor;
+            DEALLOCATE producto_cursor;
+        END
+
+        -- Relanzar el error original (del trigger u otro)
+        THROW;
+    END CATCH
 END;
 GO
 
@@ -556,13 +579,13 @@ BEGIN
     DECLARE @v_count INT;
     DECLARE @v_msg NVARCHAR(500);
 
+    -- Validaciones antes de abrir transaccion
     IF NOT EXISTS (SELECT 1 FROM factura WHERE numero = @p_numero)
     BEGIN
         SET @v_msg = CONCAT('Factura ', @p_numero, ' no existe');
         THROW 50004, @v_msg, 1;
     END
 
-    -- Validar minimo de productos
     SET @v_minimo = COALESCE(NULLIF(@p_minimo_detalle, 0), 1);
 
     IF @p_productos IS NULL
@@ -578,56 +601,77 @@ BEGIN
         THROW 50004, @v_msg, 1;
     END
 
-    -- Eliminar detalle anterior (el trigger restaura stock y recalcula total)
-    DELETE FROM productosporfactura WHERE fknumfactura = @p_numero;
+    -- ── TRANSACCION: todo o nada ──
+    -- Si un trigger falla al insertar un nuevo producto (ej: stock insuficiente),
+    -- se revierten todos los cambios: el DELETE previo, los INSERTs parciales y el UPDATE.
+    BEGIN TRY
+        BEGIN TRANSACTION;
 
-    -- Insertar nuevos productos (el trigger calcula subtotal, descuenta stock, actualiza total)
-    DECLARE producto_cursor CURSOR LOCAL FAST_FORWARD FOR
-        SELECT
-            JSON_VALUE(value, '$.codigo'),
-            CAST(JSON_VALUE(value, '$.cantidad') AS INT)
-        FROM OPENJSON(@p_productos);
+        -- Eliminar detalle anterior (el trigger restaura stock y recalcula total)
+        DELETE FROM productosporfactura WHERE fknumfactura = @p_numero;
 
-    OPEN producto_cursor;
-    FETCH NEXT FROM producto_cursor INTO @v_codigo, @v_cantidad;
+        -- Insertar nuevos productos (el trigger calcula subtotal, descuenta stock, actualiza total)
+        DECLARE producto_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT
+                JSON_VALUE(value, '$.codigo'),
+                CAST(JSON_VALUE(value, '$.cantidad') AS INT)
+            FROM OPENJSON(@p_productos);
 
-    WHILE @@FETCH_STATUS = 0
-    BEGIN
-        INSERT INTO productosporfactura (fknumfactura, fkcodproducto, cantidad, subtotal)
-        VALUES (@p_numero, @v_codigo, @v_cantidad, 0);
-
+        OPEN producto_cursor;
         FETCH NEXT FROM producto_cursor INTO @v_codigo, @v_cantidad;
-    END
 
-    CLOSE producto_cursor;
-    DEALLOCATE producto_cursor;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            INSERT INTO productosporfactura (fknumfactura, fkcodproducto, cantidad, subtotal)
+            VALUES (@p_numero, @v_codigo, @v_cantidad, 0);
 
-    -- Actualizar cliente y vendedor de la factura
-    UPDATE factura
-    SET fkidcliente = @p_fkidcliente,
-        fkidvendedor = @p_fkidvendedor
-    WHERE numero = @p_numero;
+            FETCH NEXT FROM producto_cursor INTO @v_codigo, @v_cantidad;
+        END
 
-    -- Retornar resultado como JSON
-    DECLARE @v_factura_json NVARCHAR(MAX);
-    DECLARE @v_productos_json NVARCHAR(MAX);
+        CLOSE producto_cursor;
+        DEALLOCATE producto_cursor;
 
-    SELECT @v_factura_json = (
-        SELECT f.numero, f.fecha, f.total, f.fkidcliente, f.fkidvendedor
-        FROM factura f WHERE f.numero = @p_numero
-        FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
-    );
+        -- Actualizar cliente y vendedor de la factura
+        UPDATE factura
+        SET fkidcliente = @p_fkidcliente,
+            fkidvendedor = @p_fkidvendedor
+        WHERE numero = @p_numero;
 
-    SELECT @v_productos_json = (
-        SELECT pf.fkcodproducto AS codigo_producto, pr.nombre AS nombre_producto,
-               pf.cantidad, pr.valorunitario, pf.subtotal
-        FROM productosporfactura pf
-        JOIN producto pr ON pr.codigo = pf.fkcodproducto
-        WHERE pf.fknumfactura = @p_numero
-        FOR JSON PATH
-    );
+        -- Retornar resultado como JSON
+        DECLARE @v_factura_json NVARCHAR(MAX);
+        DECLARE @v_productos_json NVARCHAR(MAX);
 
-    SET @p_resultado = '{"factura":' + @v_factura_json + ',"productos":' + ISNULL(@v_productos_json, '[]') + '}';
+        SELECT @v_factura_json = (
+            SELECT f.numero, f.fecha, f.total, f.fkidcliente, f.fkidvendedor
+            FROM factura f WHERE f.numero = @p_numero
+            FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+        );
+
+        SELECT @v_productos_json = (
+            SELECT pf.fkcodproducto AS codigo_producto, pr.nombre AS nombre_producto,
+                   pf.cantidad, pr.valorunitario, pf.subtotal
+            FROM productosporfactura pf
+            JOIN producto pr ON pr.codigo = pf.fkcodproducto
+            WHERE pf.fknumfactura = @p_numero
+            FOR JSON PATH
+        );
+
+        SET @p_resultado = '{"factura":' + @v_factura_json + ',"productos":' + ISNULL(@v_productos_json, '[]') + '}';
+
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+
+        IF CURSOR_STATUS('local', 'producto_cursor') >= 0
+        BEGIN
+            CLOSE producto_cursor;
+            DEALLOCATE producto_cursor;
+        END
+
+        THROW;
+    END CATCH
 END;
 GO
 
@@ -651,27 +695,43 @@ BEGIN
     DECLARE @v_cantidad_productos INT;
     DECLARE @v_msg NVARCHAR(500);
 
+    -- Validacion antes de abrir transaccion
     IF NOT EXISTS (SELECT 1 FROM factura WHERE numero = @p_numero)
     BEGIN
         SET @v_msg = CONCAT('Factura ', @p_numero, ' no existe');
         THROW 50005, @v_msg, 1;
     END
 
-    -- Guardar info antes de borrar para el JSON de respuesta
-    SELECT @v_cantidad_productos = COUNT(*)
-    FROM productosporfactura WHERE fknumfactura = @p_numero;
+    -- ── TRANSACCION: todo o nada ──
+    -- El DELETE CASCADE dispara el trigger de delete para cada producto,
+    -- restaurando stock. Si algo falla, se revierte todo.
+    BEGIN TRY
+        BEGIN TRANSACTION;
 
-    SELECT @v_total = f.total FROM factura f WHERE f.numero = @p_numero;
+        -- Guardar info antes de borrar para el JSON de respuesta
+        SELECT @v_cantidad_productos = COUNT(*)
+        FROM productosporfactura WHERE fknumfactura = @p_numero;
 
-    -- Borrar factura (ON DELETE CASCADE borra productosporfactura,
-    -- y el trigger restaura stock por cada producto eliminado)
-    DELETE FROM factura WHERE numero = @p_numero;
+        SELECT @v_total = f.total FROM factura f WHERE f.numero = @p_numero;
 
-    -- Retornar resultado como JSON
-    SET @p_resultado = '{"mensaje":"Factura eliminada exitosamente",' +
-        '"numero_eliminado":' + CAST(@p_numero AS NVARCHAR) + ',' +
-        '"total_eliminado":' + CAST(@v_total AS NVARCHAR) + ',' +
-        '"productos_eliminados":' + CAST(@v_cantidad_productos AS NVARCHAR) + '}';
+        -- Borrar factura (ON DELETE CASCADE borra productosporfactura,
+        -- y el trigger restaura stock por cada producto eliminado)
+        DELETE FROM factura WHERE numero = @p_numero;
+
+        -- Retornar resultado como JSON
+        SET @p_resultado = '{"mensaje":"Factura eliminada exitosamente",' +
+            '"numero_eliminado":' + CAST(@p_numero AS NVARCHAR) + ',' +
+            '"total_eliminado":' + CAST(@v_total AS NVARCHAR) + ',' +
+            '"productos_eliminados":' + CAST(@v_cantidad_productos AS NVARCHAR) + '}';
+
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0
+            ROLLBACK TRANSACTION;
+
+        THROW;
+    END CATCH
 END;
 GO
 
